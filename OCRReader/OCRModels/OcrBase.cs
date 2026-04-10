@@ -22,9 +22,22 @@ abstract class OcrBase : IReceiptOCR
 
     public abstract List<ReceiptItem> ProcessTicket(string imagePath);
 
+    // ── Debug helper ─────────────────────────────────────────────────────────
+
+    public string DebugExtractRawText(string imagePath)
+    {
+        var (text, confidence) = ExtractRawText(imagePath);
+        return $"[Confidence: {confidence:P2}]\n\n{text}";
+    }
+
     // ── Tesseract OCR extraction ─────────────────────────────────────────────
 
     protected (string Text, double Confidence) ExtractRawText(string imagePath)
+    {
+        return ExtractRawText(imagePath, PageSegMode.Auto);
+    }
+
+    protected (string Text, double Confidence) ExtractRawText(string imagePath, PageSegMode pageSegMode)
     {
         if (!File.Exists(imagePath))
             throw new FileNotFoundException($"Image file not found: {imagePath}");
@@ -40,8 +53,43 @@ abstract class OcrBase : IReceiptOCR
         ms.Position = 0;
         using var pix = Pix.LoadFromMemory(ms.ToArray());
 
-        using var page = engine.Process(pix, PageSegMode.Auto);
+        using var page = engine.Process(pix, pageSegMode);
         return (page.GetText(), page.GetMeanConfidence());
+    }
+
+    /// <summary>
+    /// Multi-pass OCR with different page segmentation modes.
+    /// </summary>
+    protected (string Text, double Confidence) ExtractRawTextMultiPass(string imagePath)
+    {
+        var modes = new[]
+        {
+            PageSegMode.Auto,
+            PageSegMode.SingleBlock,
+            PageSegMode.SingleColumn,
+            PageSegMode.SparseText
+        };
+
+        string bestText = "";
+        double bestConfidence = 0;
+
+        foreach (var mode in modes)
+        {
+            try
+            {
+                var (text, confidence) = ExtractRawText(imagePath, mode);
+                // Prefer longer text with reasonable confidence
+                double score = confidence * text.Length;
+                if (score > bestConfidence * Math.Max(bestText.Length, 1))
+                {
+                    bestConfidence = confidence;
+                    bestText = text;
+                }
+            }
+            catch { }
+        }
+
+        return (bestText, bestConfidence);
     }
 
     // ── Supermarket detection ────────────────────────────────────────────────
@@ -80,7 +128,7 @@ abstract class OcrBase : IReceiptOCR
         return (total, date);
     }
 
-    // ── Basic line-by-line parsing (used by BronzeOCR, overridden by others) ─
+    // ── Basic line-by-line parsing ───────────────────────────────────────────
 
     protected static List<ReceiptItem> BasicParse(string text, string supermarket)
     {
@@ -92,7 +140,7 @@ abstract class OcrBase : IReceiptOCR
             var line = raw.Trim();
             if (line.Length < 2) continue;
 
-            // Pattern A: "N x ( PRICE )" — multi-quantity sub-line
+            // Pattern A: "N x ( PRICE )"
             var qtyMatch = Regex.Match(line,
                 @"^(\d+)\s*[xX×]\s*\(?\s*([\d]+[,\.][\d]{2})\s*\)?");
             if (qtyMatch.Success && pending != null)
@@ -107,7 +155,7 @@ abstract class OcrBase : IReceiptOCR
                 continue;
             }
 
-            // Pattern B: "PRODUCT   PRICE" on the same line (2+ spaces before price)
+            // Pattern B: "PRODUCT   PRICE" (2+ spaces)
             var sameLineMatch = Regex.Match(line,
                 @"^(?:\d+\s+)?(.+?)\s{2,}([\d]+[,\.][\d]{2})\s*€?\s*$");
             if (sameLineMatch.Success)
@@ -124,7 +172,7 @@ abstract class OcrBase : IReceiptOCR
                 }
             }
 
-            // Pattern C: standalone price — associate with the pending product
+            // Pattern C: standalone price
             var standaloneMatch = Regex.Match(line, @"^([\d]+[,\.][\d]{2})\s*€?\s*$");
             if (standaloneMatch.Success && pending != null)
             {
@@ -137,40 +185,56 @@ abstract class OcrBase : IReceiptOCR
                 continue;
             }
 
-            // No price found — keep as pending product name for the next line
+            // No price — keep as pending
             pending = IsSkippable(line) ? null : line;
         }
 
         return items;
     }
 
-    // ── Preprocessing pipeline ───────────────────────────────────────────────
+    // ── Preprocessing: grayscale → deskew → upscale → threshold ──────────────
 
     private static Bitmap Preprocess(Bitmap original)
     {
-        using var upscaled = Upscale(original, targetMinSide: 1800);
-        using var gray = ToGrayscale(upscaled);
-        using var blurred = GaussianBlur(gray);
-        return AdaptiveBinarize(blurred);
+        using var gray = ToGrayscale(original);
+
+        // Deskew only if image is large enough
+        using var deskewed = gray.Width > 100 && gray.Height > 100 ? Deskew(gray) : new Bitmap(gray);
+
+        using var upscaled = Upscale(deskewed, 2400);
+        return SimpleThreshold(upscaled);
     }
 
-    private static Bitmap Upscale(Bitmap src, int targetMinSide)
+    /// <summary>
+    /// Simple fixed threshold - more reliable than Otsu for receipts.
+    /// </summary>
+    private static Bitmap SimpleThreshold(Bitmap src)
     {
-        int minSide = Math.Min(src.Width, src.Height);
-        if (minSide >= targetMinSide)
-            return new Bitmap(src);
+        var (pixels, stride) = LockRead(src);
+        int w = src.Width, h = src.Height;
 
-        float scale = (float)targetMinSide / minSide;
-        int newW = (int)(src.Width * scale);
-        int newH = (int)(src.Height * scale);
+        // Use fixed threshold of 180 (works well for black text on white paper)
+        const int threshold = 180;
+        var result = new byte[stride * h];
 
-        var dst = new Bitmap(newW, newH, PixelFormat.Format24bppRgb);
-        using var g = Graphics.FromImage(dst);
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.DrawImage(src, 0, 0, newW, newH);
-        return dst;
+        int blackCount = 0;
+        for (int i = 0; i < pixels.Length; i += 3)
+        {
+            byte val = pixels[i] < threshold ? (byte)0 : (byte)255;
+            if (val == 0) blackCount++;
+            result[i] = result[i + 1] = result[i + 2] = val;
+        }
+
+        // If too few black pixels (< 0.1%), return grayscale instead
+        if (blackCount < pixels.Length * 0.001)
+        {
+            Array.Copy(pixels, result, pixels.Length);
+        }
+
+        return CreateBitmap(result, w, h, stride);
     }
+
+    // ── Step 1: Grayscale ────────────────────────────────────────────────────
 
     private static Bitmap ToGrayscale(Bitmap src)
     {
@@ -182,96 +246,126 @@ abstract class OcrBase : IReceiptOCR
             for (int x = 0; x < w; x++)
             {
                 int i = y * stride + x * 3;
-                byte luma = (byte)(pixels[i + 2] * 0.299 + pixels[i + 1] * 0.587 + pixels[i] * 0.114);
+                byte luma = (byte)(pixels[i + 2] * 0.2126 + pixels[i + 1] * 0.7152 + pixels[i] * 0.0722);
                 result[i] = result[i + 1] = result[i + 2] = luma;
             }
 
         return CreateBitmap(result, w, h, stride);
     }
 
-    private static Bitmap GaussianBlur(Bitmap src)
+    // ── Step 2: Deskew ───────────────────────────────────────────────────────
+
+    private static Bitmap Deskew(Bitmap src)
     {
-        ReadOnlySpan<int> dx = [-1, 0, 1, -1, 0, 1, -1, 0, 1];
-        ReadOnlySpan<int> dy = [-1, -1, -1, 0, 0, 0, 1, 1, 1];
-        ReadOnlySpan<float> kw = [1f, 2f, 1f, 2f, 4f, 2f, 1f, 2f, 1f];
+        using var small = Resize(src, Math.Min(src.Width, 400), Math.Min(src.Height, 400));
+        var (pixels, stride) = LockRead(small);
+        int sw = small.Width, sh = small.Height;
 
-        var (pixels, stride) = LockRead(src);
-        int w = src.Width, h = src.Height;
-        var result = new byte[stride * h];
+        double bestAngle = 0;
+        int maxVariance = 0;
 
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
+        for (int angleDeg = -50; angleDeg <= 50; angleDeg += 2)
+        {
+            double angle = angleDeg / 10.0;
+            double radians = angle * Math.PI / 180.0;
+            int variance = CalculateProjectionVariance(pixels, stride, sw, sh, radians);
+            if (variance > maxVariance)
             {
-                float sum = 0;
-                for (int k = 0; k < 9; k++)
-                {
-                    int px = Math.Clamp(x + dx[k], 0, w - 1);
-                    int py = Math.Clamp(y + dy[k], 0, h - 1);
-                    sum += pixels[py * stride + px * 3] * kw[k];
-                }
-                byte val = (byte)Math.Clamp((int)(sum / 16f), 0, 255);
-                int i = y * stride + x * 3;
-                result[i] = result[i + 1] = result[i + 2] = val;
+                maxVariance = variance;
+                bestAngle = angle;
             }
+        }
 
-        return CreateBitmap(result, w, h, stride);
+        // Fine-tune
+        for (int angleDeg = (int)((bestAngle - 0.5) * 10); angleDeg <= (int)((bestAngle + 0.5) * 10); angleDeg++)
+        {
+            double angle = angleDeg / 10.0;
+            double radians = angle * Math.PI / 180.0;
+            int variance = CalculateProjectionVariance(pixels, stride, sw, sh, radians);
+            if (variance > maxVariance)
+            {
+                maxVariance = variance;
+                bestAngle = angle;
+            }
+        }
+
+        if (Math.Abs(bestAngle) > 0.3)
+            return RotateImage(src, (float)-bestAngle);
+
+        return new Bitmap(src);
     }
 
-    private static Bitmap AdaptiveBinarize(Bitmap src)
+    private static int CalculateProjectionVariance(byte[] pixels, int stride, int w, int h, double radians)
     {
-        var (pixels, stride) = LockRead(src);
-        int w = src.Width, h = src.Height;
-        int iStride = w + 1;
-
-        var integral   = new long[iStride * (h + 1)];
-        var integralSq = new long[iStride * (h + 1)];
+        double cos = Math.Cos(radians);
+        double sin = Math.Sin(radians);
+        var projection = new int[w];
+        double cx = w / 2.0, cy = h / 2.0;
 
         for (int y = 0; y < h; y++)
             for (int x = 0; x < w; x++)
             {
-                long v = pixels[y * stride + x * 3];
-                int iy = y + 1, ix = x + 1;
-                integral[iy * iStride + ix] = v
-                    + integral[(iy - 1) * iStride + ix]
-                    + integral[iy * iStride + (ix - 1)]
-                    - integral[(iy - 1) * iStride + (ix - 1)];
-                integralSq[iy * iStride + ix] = v * v
-                    + integralSq[(iy - 1) * iStride + ix]
-                    + integralSq[iy * iStride + (ix - 1)]
-                    - integralSq[(iy - 1) * iStride + (ix - 1)];
+                double dx = x - cx, dy = y - cy;
+                int rx = (int)(cx + dx * cos - dy * sin);
+                int ry = (int)(cy + dx * sin + dy * cos);
+                if (rx >= 0 && rx < w && ry >= 0 && ry < h)
+                {
+                    if (pixels[ry * stride + rx * 3] < 128)
+                        projection[rx]++;
+                }
             }
 
-        int r = Math.Clamp(Math.Min(w, h) / 40, 15, 60);
-        const double k = 0.34, R = 128.0;
+        double mean = projection.Sum() / (double)w;
+        double variance = 0;
+        foreach (int count in projection)
+            variance += (count - mean) * (count - mean);
 
-        var result = new byte[stride * h];
-        for (int y = 0; y < h; y++)
-            for (int x = 0; x < w; x++)
-            {
-                int x1 = Math.Max(x - r, 0), y1 = Math.Max(y - r, 0);
-                int x2 = Math.Min(x + r, w - 1), y2 = Math.Min(y + r, h - 1);
-                int count = (x2 - x1 + 1) * (y2 - y1 + 1);
+        return (int)(variance / w);
+    }
 
-                long s = integral[(y2 + 1) * iStride + (x2 + 1)]
-                       - integral[y1 * iStride + (x2 + 1)]
-                       - integral[(y2 + 1) * iStride + x1]
-                       + integral[y1 * iStride + x1];
+    private static Bitmap RotateImage(Bitmap src, float angle)
+    {
+        var dst = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
+        using var g = Graphics.FromImage(dst);
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.Clear(Color.White);
+        g.TranslateTransform(src.Width / 2f, src.Height / 2f);
+        g.RotateTransform(angle);
+        g.TranslateTransform(-src.Width / 2f, -src.Height / 2f);
+        g.DrawImage(src, 0, 0);
+        return dst;
+    }
 
-                long sq = integralSq[(y2 + 1) * iStride + (x2 + 1)]
-                        - integralSq[y1 * iStride + (x2 + 1)]
-                        - integralSq[(y2 + 1) * iStride + x1]
-                        + integralSq[y1 * iStride + x1];
+    // ── Step 3: Upscale ──────────────────────────────────────────────────────
 
-                double mean   = (double)s / count;
-                double stdDev = Math.Sqrt(Math.Max(0.0, (double)sq / count - mean * mean));
+    private static Bitmap Upscale(Bitmap src, int targetMinSide)
+    {
+        int minSide = Math.Min(src.Width, src.Height);
+        if (minSide >= targetMinSide)
+            return new Bitmap(src);
 
-                double threshold = mean * (1.0 + k * (stdDev / R - 1.0));
-                byte val = pixels[y * stride + x * 3] >= threshold ? (byte)255 : (byte)0;
-                int i = y * stride + x * 3;
-                result[i] = result[i + 1] = result[i + 2] = val;
-            }
+        float scale = (float)targetMinSide / minSide;
+        int newW = Math.Max(100, (int)(src.Width * scale));
+        int newH = Math.Max(100, (int)(src.Height * scale));
 
-        return CreateBitmap(result, w, h, stride);
+        var dst = new Bitmap(newW, newH, PixelFormat.Format24bppRgb);
+        using var g = Graphics.FromImage(dst);
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.DrawImage(src, 0, 0, newW, newH);
+        return dst;
+    }
+
+    // ── Resize helper ────────────────────────────────────────────────────────
+
+    private static Bitmap Resize(Bitmap src, int newW, int newH)
+    {
+        var dst = new Bitmap(newW, newH, PixelFormat.Format24bppRgb);
+        using var g = Graphics.FromImage(dst);
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.DrawImage(src, 0, 0, newW, newH);
+        return dst;
     }
 
     // ── Bitmap helpers ───────────────────────────────────────────────────────
@@ -321,7 +415,7 @@ abstract class OcrBase : IReceiptOCR
         SkipKeywords.Any(kw => name.StartsWith(kw, StringComparison.OrdinalIgnoreCase)) ||
         Regex.IsMatch(name, @"^[\d\s,\.\-\*\/\(\)x×]+$");
 
-    // ── String similarity helper ─────────────────────────────────────────────
+    // ── Levenshtein distance ─────────────────────────────────────────────────
 
     protected static int LevenshteinDistance(string a, string b)
     {
@@ -330,9 +424,7 @@ abstract class OcrBase : IReceiptOCR
 
         var prev = new int[b.Length + 1];
         var curr = new int[b.Length + 1];
-
-        for (int j = 0; j <= b.Length; j++)
-            prev[j] = j;
+        for (int j = 0; j <= b.Length; j++) prev[j] = j;
 
         for (int i = 1; i <= a.Length; i++)
         {
@@ -340,9 +432,7 @@ abstract class OcrBase : IReceiptOCR
             for (int j = 1; j <= b.Length; j++)
             {
                 int cost = char.ToUpperInvariant(a[i - 1]) == char.ToUpperInvariant(b[j - 1]) ? 0 : 1;
-                curr[j] = Math.Min(
-                    Math.Min(curr[j - 1] + 1, prev[j] + 1),
-                    prev[j - 1] + cost);
+                curr[j] = Math.Min(Math.Min(curr[j - 1] + 1, prev[j] + 1), prev[j - 1] + cost);
             }
             (prev, curr) = (curr, prev);
         }

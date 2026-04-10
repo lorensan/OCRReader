@@ -1,7 +1,5 @@
 /// <summary>
-/// Bronze-level OCR: basic Tesseract text recognition with simple
-/// line-by-line regex parsing. Reads text, detects prices, and
-/// associates them with the nearest product name.
+/// Bronze-level OCR: basic multi-pass Tesseract with line-by-line parsing.
 /// </summary>
 class BronzeOCR : OcrBase
 {
@@ -9,7 +7,7 @@ class BronzeOCR : OcrBase
 
     public override List<ReceiptItem> ProcessTicket(string imagePath)
     {
-        var (text, _) = ExtractRawText(imagePath);
+        var (text, _) = ExtractRawTextMultiPass(imagePath);
         string supermarket = ExtractSupermarket(text);
         return BasicParse(text, supermarket);
     }
