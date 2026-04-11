@@ -29,6 +29,8 @@ class SilverOCR : OcrBase
         }
         text = sb.ToString();
         text = text.Replace("}", ")").Replace("{", "(").Replace("[", "(").Replace("]", ")");
+        // Replace '?' with '€' when it appears after a price number
+        text = Regex.Replace(text, @"([\d]+[,\.][\d]{2})\s*\?", "$1€");
         text = Regex.Replace(text, @"[ \t]{3,}", "  ");
         text = Regex.Replace(text, @"(?<=\s)[^\w\d€\n](?=\s)", " ");
         return text;

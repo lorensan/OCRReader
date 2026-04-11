@@ -47,10 +47,13 @@ class GoldOCR : OcrBase
                 sb.Append(c);
                 continue;
             }
+            // Replace '?' that should be '€' in price contexts
             if (c >= '\x20' && c <= '\x7E' || c >= '\xA0' && c <= '\xFF' || c == '€' || c == '×')
                 sb.Append(c);
         }
         text = sb.ToString();
+        // Replace '?' with '€' when it appears after a price number
+        text = Regex.Replace(text, @"([\d]+[,\.][\d]{2})\s*\?", "$1€");
         text = Regex.Replace(text, @"\r\n?", "\n");
         text = text.Replace("}", ")");
         text = text.Replace("{", "(");

@@ -1,7 +1,11 @@
-﻿class Program
+﻿using System.Globalization;
+
+class Program
 {
     static void Main()
     {
+        Console.OutputEncoding = System.Text.Encoding.UTF8;
+
         var sampleDir = @"./Samples";
         var imageFiles = Directory.GetFiles(sampleDir, "*.jpeg")
             .Concat(Directory.GetFiles(sampleDir, "*.jpg"))
@@ -46,20 +50,16 @@
                 PrintItems(goldItems);
 
                 // Final receipt from Gold
-                Console.WriteLine("\n--- FINAL RECEIPT (Gold) ---");
-                if (goldItems.Count > 0)
+                Console.WriteLine("\n--- FINAL RECEIPT MERGED ---");
+                var mergedReceipt = MergeOCRResult.MergeOCRModels(bronzeItems, silverItems, goldItems);
+                if (mergedReceipt.Products.Count > 0)
                 {
-                    var receipt = new Receipt
-                    {
-                        Supermarket = goldItems[0].Supermarket,
-                        Products = goldItems.Select(x => new Product { Name = x.Product, Price = x.Price.ToString("0.00") }).ToList()
-                    };
-                    Console.WriteLine($"Supermercado: {receipt.Supermarket}");
-                    Console.WriteLine($"Productos: {receipt.Products.Count}");
-                    decimal total = receipt.Products.Sum(p => decimal.TryParse(p.Price, out var v) ? v : 0);
+                    Console.WriteLine($"Supermercado: {mergedReceipt.Supermarket}");
+                    Console.WriteLine($"Productos: {mergedReceipt.Products.Count}");
+                    decimal total = mergedReceipt.Products.Sum(p => decimal.TryParse(p.Price, NumberStyles.Number, CultureInfo.InvariantCulture, out var v) ? v : 0);
                     Console.WriteLine($"Total: {total:F2}€");
-                    foreach (var p in receipt.Products)
-                        Console.WriteLine($"  {p.Name,-35} {p.Price,8}€");
+                    foreach (var p in mergedReceipt.Products)
+                        Console.WriteLine($"  {p.Name,-35} {MergeOCRResult.FormatPrice(p.Price),8}€");
                 }
                 else
                 {
