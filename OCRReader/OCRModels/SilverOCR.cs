@@ -6,7 +6,7 @@ using System.Text.RegularExpressions;
 /// Silver-level OCR: Tesseract with text cleaning, column detection,
 /// and enhanced product-price parsing.
 /// </summary>
-class SilverOCR : OcrBase
+public class SilverOCR : OcrBase
 {
     public SilverOCR(string tessDataPath = @"./tessdata") : base(tessDataPath) { }
 

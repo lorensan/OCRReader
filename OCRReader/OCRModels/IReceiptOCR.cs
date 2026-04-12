@@ -2,7 +2,7 @@
 /// Common interface for Receipt OCR processing at different accuracy levels.
 /// Each implementation applies progressively more sophisticated heuristics.
 /// </summary>
-interface IReceiptOCR
+public interface IReceiptOCR
 {
     /// <summary>
     /// Processes a receipt image and extracts product items.

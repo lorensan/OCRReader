@@ -1,7 +1,7 @@
 /// <summary>
 /// Bronze-level OCR: basic multi-pass Tesseract with line-by-line parsing.
 /// </summary>
-class BronzeOCR : OcrBase
+public class BronzeOCR : OcrBase
 {
     public BronzeOCR(string tessDataPath = @"./tessdata") : base(tessDataPath) { }
 

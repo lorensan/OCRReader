@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="OCRReader/OCRReader.csproj" />
+  <Project Path="OCRReader.Tests/OCRReader.Tests.csproj" />
 </Solution>

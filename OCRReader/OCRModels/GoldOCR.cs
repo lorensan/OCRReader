@@ -6,7 +6,7 @@ using System.Text.RegularExpressions;
 /// Gold-level OCR: multi-pass Tesseract with different segmentation modes,
 /// advanced text cleaning, pattern recognition, deduplication, and validation.
 /// </summary>
-class GoldOCR : OcrBase
+public class GoldOCR : OcrBase
 {
     public GoldOCR(string tessDataPath = @"./tessdata") : base(tessDataPath) { }
 

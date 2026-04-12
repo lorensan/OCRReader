@@ -5,7 +5,7 @@ using System.Text.RegularExpressions;
 /// Merges OCR results from Bronze, Silver, and Gold models into a single best-quality Receipt.
 /// Applies product name validation, currency normalization, and cross-model consensus.
 /// </summary>
-class MergeOCRResult
+public static class MergeOCRResult
 {
     /// <summary>
     /// Merges results from three OCR models into a single Receipt with the best quality possible.

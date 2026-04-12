@@ -11,7 +11,7 @@ using System.IO;
 /// Base class providing shared Tesseract OCR extraction, image preprocessing,
 /// supermarket detection, metadata extraction, and common parsing helpers.
 /// </summary>
-abstract class OcrBase : IReceiptOCR
+public abstract class OcrBase : IReceiptOCR
 {
     protected readonly string TessDataPath;
 
