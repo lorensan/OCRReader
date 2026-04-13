@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(dotnet *)",
-      "Bash(findstr *)"
+      "Bash(findstr *)",
+      "WebFetch(github.com)"
     ]
   },
   "$version": 3

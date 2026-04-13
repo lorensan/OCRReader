@@ -23,15 +23,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="Samples\Receipt1.jpeg">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-    <None Update="Samples\Receipt3.jpeg">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
-    <None Update="Samples\Receipt4.jpeg">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </None>
+    <Folder Include="Samples\" />
   </ItemGroup>
 
 </Project>

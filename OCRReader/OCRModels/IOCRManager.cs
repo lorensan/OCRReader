@@ -10,4 +10,11 @@ public interface IOCRManager
     /// <param name="imagePath">Path to the receipt image file.</param>
     /// <returns>A fully parsed and merged Receipt object.</returns>
     Receipt ProcessReceipt(string imagePath);
+    
+    /// <summary>
+    /// Processes a receipt image with confidence scoring and validation.
+    /// </summary>
+    /// <param name="imagePath">Path to the receipt image file.</param>
+    /// <returns>An OcrResult containing the receipt, confidence scores, and validation warnings.</returns>
+    OcrResult ProcessReceiptWithValidation(string imagePath);
 }

@@ -11,6 +11,9 @@ using System.IO;
 public abstract class OcrBase : IReceiptOCR
 {
     protected readonly string TessDataPath;
+    
+    /// <summary>Last OCR confidence score (0.0 to 1.0).</summary>
+    protected double LastOcrConfidence { get; private set; }
 
     protected OcrBase(string tessDataPath = @"./tessdata")
     {
@@ -44,6 +47,8 @@ public abstract class OcrBase : IReceiptOCR
 
         using var engine = new TesseractEngine(TessDataPath, "spa+eng", EngineMode.LstmOnly);
         engine.SetVariable("preserve_interword_spaces", "1");
+        // Set resolution explicitly to avoid "Estimating resolution" message
+        engine.SetVariable("user_defined_dpi", "300");
 
         using var ms = new MemoryStream();
         processed.Encode(ms, SKEncodedImageFormat.Png, 100);
@@ -64,7 +69,9 @@ public abstract class OcrBase : IReceiptOCR
             PageSegMode.Auto,
             PageSegMode.SingleBlock,
             PageSegMode.SingleColumn,
-            PageSegMode.SparseText
+            PageSegMode.SparseText,
+            // Add table-optimized modes for receipts like Dia's
+            PageSegMode.SingleBlockVertText
         };
 
         string bestText = "";
@@ -86,6 +93,7 @@ public abstract class OcrBase : IReceiptOCR
             catch { }
         }
 
+        LastOcrConfidence = bestConfidence;
         return (bestText, bestConfidence);
     }
 
@@ -127,7 +135,7 @@ public abstract class OcrBase : IReceiptOCR
 
     // ── Basic line-by-line parsing ───────────────────────────────────────────
 
-    protected static List<ReceiptItem> BasicParse(string text, string supermarket)
+    protected static List<ReceiptItem> BasicParse(string text, string supermarket, double confidence = 0.80)
     {
         var items = new List<ReceiptItem>();
         string? pending = null;
@@ -146,7 +154,7 @@ public abstract class OcrBase : IReceiptOCR
                     decimal.TryParse(qtyMatch.Groups[2].Value.Replace(',', '.'),
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal unit))
                 {
-                    items.Add(new ReceiptItem(supermarket, pending, qty * unit));
+                    items.Add(new ReceiptItem(supermarket, pending, qty * unit, confidence * 0.9));
                     pending = null;
                 }
                 continue;
@@ -163,7 +171,47 @@ public abstract class OcrBase : IReceiptOCR
                     decimal.TryParse(priceStr,
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price))
                 {
-                    items.Add(new ReceiptItem(supermarket, name, price));
+                    items.Add(new ReceiptItem(supermarket, name, price, confidence));
+                    pending = null;
+                    continue;
+                }
+            }
+
+            // Pattern D: Table format - "PRODUCT   QTY   PRICE   TOTAL" (Dia-style receipts)
+            // Matches lines like: "PETIT FRESA 6 X 50 G  1ud  0,99€  0,99€ A"
+            // or: "BANANA  1,550kg  1,11 €/kg  1,72€ A"
+            // Also handles OCR errors where commas are lost: "115€" instead of "1,15€"
+            // Try multiple variations for robustness
+            var tableMatch = Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d]+?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?)?)\s+([\d]+[,\.]?[\d]{2})\s*€?\s*(?:€?/kg)?\s+([\d]+[,\.]?[\d]{2})\s*€?\s*[A-Z]?\s*$",
+                RegexOptions.IgnoreCase);
+
+            // Fallback pattern D2: Simpler table format without strict column structure
+            // Matches: "PRODUCT  QTY  PRICE  TOTAL" where columns might have varying spacing
+            if (!tableMatch.Success)
+            {
+                tableMatch = Regex.Match(line,
+                    @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d'\(\)]{3,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?)?)\s+([\d]+[,\.]?[\d]{2})\s*€?\s+([\d]+[,\.]?[\d]{2})\s*€",
+                    RegexOptions.IgnoreCase);
+            }
+
+            if (tableMatch.Success)
+            {
+                string name = tableMatch.Groups[1].Value.Trim();
+                string totalStr = tableMatch.Groups[4].Value;
+
+                // Fix OCR errors: if no comma/period, insert one (e.g., "115" → "1,15")
+                if (!totalStr.Contains(',') && !totalStr.Contains('.'))
+                {
+                    if (totalStr.Length >= 3)
+                        totalStr = totalStr.Insert(totalStr.Length - 2, ",");
+                }
+
+                if (!IsSkippable(name) && name.Length >= 3 &&
+                    decimal.TryParse(totalStr.Replace(',', '.'),
+                        NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) && price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, name, price, confidence * 0.95)); // Table format is reliable
                     pending = null;
                     continue;
                 }
@@ -176,7 +224,7 @@ public abstract class OcrBase : IReceiptOCR
                 if (decimal.TryParse(standaloneMatch.Groups[1].Value.Replace(',', '.'),
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price))
                 {
-                    items.Add(new ReceiptItem(supermarket, pending, price));
+                    items.Add(new ReceiptItem(supermarket, pending, price, confidence * 0.85));
                     pending = null;
                 }
                 continue;
@@ -193,85 +241,190 @@ public abstract class OcrBase : IReceiptOCR
 
     private static SKBitmap Preprocess(SKBitmap original)
     {
-        using var gray = ToGrayscale(original);
+        // Limit input size first to avoid processing huge images
+        int maxInputSide = 2000;
+        int maxOrigSide = Math.Max(original.Width, original.Height);
+        SKBitmap limited;
+        if (maxOrigSide > maxInputSide)
+        {
+            float scale = (float)maxInputSide / maxOrigSide;
+            int newW = Math.Max(100, (int)(original.Width * scale));
+            int newH = Math.Max(100, (int)(original.Height * scale));
+            limited = Resize(original, newW, newH);
+        }
+        else
+        {
+            limited = original.Copy();
+        }
+
+        using var _limited = limited;
+        using var gray = ToGrayscaleFast(limited);
 
         // Deskew only if image is large enough
-        using var deskewed = gray.Width > 100 && gray.Height > 100 ? Deskew(gray) : gray.Copy();
+        using var deskewed = gray.Width > 100 && gray.Height > 100 ? DeskewFast(gray) : gray.Copy();
 
-        using var upscaled = Upscale(deskewed, 2400);
-        return SimpleThreshold(upscaled);
+        // Reduce upscale target to reasonable size for Tesseract
+        using var upscaled = Upscale(deskewed, 1200);
+        return SimpleThresholdFast(upscaled);
     }
 
     /// <summary>
     /// Simple fixed threshold - more reliable than Otsu for receipts.
+    /// Optimized with direct pixel buffer access for speed.
     /// </summary>
-    private static SKBitmap SimpleThreshold(SKBitmap src)
+    private static SKBitmap SimpleThresholdFast(SKBitmap src)
     {
         int w = src.Width, h = src.Height;
         var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
 
-        // Use fixed threshold of 180 (works well for black text on white paper)
+        var srcInfo = src.PeekPixels();
+        var dstInfo = result.PeekPixels();
+        
+        if (srcInfo != null && dstInfo != null)
+        {
+            var srcBytes = srcInfo.GetPixelSpan();
+            var dstBytes = dstInfo.GetPixelSpan();
+
+            const int threshold = 180;
+            int blackCount = 0;
+            int totalPixels = w * h;
+
+            unsafe
+            {
+                fixed (byte* srcPtr = srcBytes, dstPtr = dstBytes)
+                {
+                    // RGB888x is 4 bytes per pixel (BGRX)
+                    for (int i = 0; i < totalPixels; i++)
+                    {
+                        int idx = i * 4;
+                        byte b = srcPtr[idx];
+                        byte g = srcPtr[idx + 1];
+                        byte r = srcPtr[idx + 2];
+                        
+                        // Fast grayscale: average is close enough for thresholding
+                        byte gray = (byte)((r + g + b) / 3);
+                        byte val = gray < threshold ? (byte)0 : (byte)255;
+                        if (val == 0) blackCount++;
+                        
+                        dstPtr[idx] = val;
+                        dstPtr[idx + 1] = val;
+                        dstPtr[idx + 2] = val;
+                        dstPtr[idx + 3] = 0; // X byte
+                    }
+                }
+            }
+
+            // If too few black pixels (< 0.1%), return grayscale instead
+            if (blackCount < totalPixels * 0.001)
+            {
+                result.Dispose();
+                return src.Copy();
+            }
+        }
+        else
+        {
+            // Fallback to slow method if PeekPixels fails
+            return SimpleThresholdFallback(src);
+        }
+
+        return result;
+    }
+
+    private static SKBitmap SimpleThresholdFallback(SKBitmap src)
+    {
+        int w = src.Width, h = src.Height;
+        var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
         const int threshold = 180;
-        int blackCount = 0;
 
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < w; x++)
             {
                 var pixel = src.GetPixel(x, y);
-                // Calculate grayscale manually: 0.2126*R + 0.7152*G + 0.0722*B
                 byte gray = (byte)(pixel.Red * 0.2126 + pixel.Green * 0.7152 + pixel.Blue * 0.0722);
                 byte val = gray < threshold ? (byte)0 : (byte)255;
-                if (val == 0) blackCount++;
                 result.SetPixel(x, y, new SKColor(val, val, val));
             }
         }
-
-        // If too few black pixels (< 0.1%), return grayscale instead
-        int totalPixels = w * h;
-        if (blackCount < totalPixels * 0.001)
-        {
-            result.Dispose();
-            return src.Copy();
-        }
-
         return result;
     }
 
-    // ── Step 1: Grayscale ────────────────────────────────────────────────────
+    // ── Step 1: Grayscale (fast version) ─────────────────────────────────────
 
-    private static SKBitmap ToGrayscale(SKBitmap src)
+    private static SKBitmap ToGrayscaleFast(SKBitmap src)
     {
         int w = src.Width, h = src.Height;
         var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
 
-        for (int y = 0; y < h; y++)
+        var srcInfo = src.PeekPixels();
+        var dstInfo = result.PeekPixels();
+        
+        if (srcInfo != null && dstInfo != null)
         {
-            for (int x = 0; x < w; x++)
+            var srcBytes = srcInfo.GetPixelSpan();
+            var dstBytes = dstInfo.GetPixelSpan();
+            int totalPixels = w * h;
+
+            unsafe
             {
-                var pixel = src.GetPixel(x, y);
-                byte luma = (byte)(pixel.Red * 0.2126 + pixel.Green * 0.7152 + pixel.Blue * 0.0722);
-                result.SetPixel(x, y, new SKColor(luma, luma, luma));
+                fixed (byte* srcPtr = srcBytes, dstPtr = dstBytes)
+                {
+                    for (int i = 0; i < totalPixels; i++)
+                    {
+                        int idx = i * 4;
+                        byte b = srcPtr[idx];
+                        byte g = srcPtr[idx + 1];
+                        byte r = srcPtr[idx + 2];
+                        
+                        // Fast grayscale: approximation of 0.299R + 0.587G + 0.114B
+                        byte gray = (byte)((r * 77 + g * 151 + b * 28) >> 8);
+                        
+                        dstPtr[idx] = gray;
+                        dstPtr[idx + 1] = gray;
+                        dstPtr[idx + 2] = gray;
+                        dstPtr[idx + 3] = 0;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Fallback
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    var pixel = src.GetPixel(x, y);
+                    byte luma = (byte)(pixel.Red * 0.2126 + pixel.Green * 0.7152 + pixel.Blue * 0.0722);
+                    result.SetPixel(x, y, new SKColor(luma, luma, luma));
+                }
             }
         }
 
         return result;
     }
 
-    // ── Step 2: Deskew ───────────────────────────────────────────────────────
+    // ── Step 2: Deskew (fast version) ────────────────────────────────────────
 
-    private static SKBitmap Deskew(SKBitmap src)
+    private static SKBitmap DeskewFast(SKBitmap src)
     {
-        using var small = Resize(src, Math.Min(src.Width, 400), Math.Min(src.Height, 400));
+        int origW = src.Width, origH = src.Height;
         
+        // Work on a smaller image for speed
+        int smallSide = Math.Min(Math.Min(origW, origH), 300);
+        using var small = Resize(src, 
+            Math.Min(origW, smallSide), 
+            Math.Min(origH, smallSide));
+
         double bestAngle = 0;
         int maxVariance = 0;
 
-        for (int angleDeg = -50; angleDeg <= 50; angleDeg += 2)
+        // Coarse search: fewer angles
+        for (int angleDeg = -30; angleDeg <= 30; angleDeg += 3)
         {
             double angle = angleDeg / 10.0;
             double radians = angle * Math.PI / 180.0;
-            int variance = CalculateProjectionVariance(small, radians);
+            int variance = CalculateProjectionVarianceFast(small, radians);
             if (variance > maxVariance)
             {
                 maxVariance = variance;
@@ -279,12 +432,14 @@ public abstract class OcrBase : IReceiptOCR
             }
         }
 
-        // Fine-tune
-        for (int angleDeg = (int)((bestAngle - 0.5) * 10); angleDeg <= (int)((bestAngle + 0.5) * 10); angleDeg++)
+        // Fine-tune around best angle
+        double startFine = (bestAngle - 0.3) * 10;
+        double endFine = (bestAngle + 0.3) * 10;
+        for (int angleDeg = (int)startFine; angleDeg <= (int)endFine; angleDeg++)
         {
             double angle = angleDeg / 10.0;
             double radians = angle * Math.PI / 180.0;
-            int variance = CalculateProjectionVariance(small, radians);
+            int variance = CalculateProjectionVarianceFast(small, radians);
             if (variance > maxVariance)
             {
                 maxVariance = variance;
@@ -292,13 +447,13 @@ public abstract class OcrBase : IReceiptOCR
             }
         }
 
-        if (Math.Abs(bestAngle) > 0.3)
+        if (Math.Abs(bestAngle) > 0.5)
             return RotateImage(src, (float)-bestAngle);
 
         return src.Copy();
     }
 
-    private static int CalculateProjectionVariance(SKBitmap bmp, double radians)
+    private static int CalculateProjectionVarianceFast(SKBitmap bmp, double radians)
     {
         int w = bmp.Width, h = bmp.Height;
         var projection = new int[w];
@@ -306,20 +461,48 @@ public abstract class OcrBase : IReceiptOCR
         double cos = Math.Cos(radians);
         double sin = Math.Sin(radians);
 
-        for (int y = 0; y < h; y++)
+        var info = bmp.PeekPixels();
+        if (info != null)
         {
-            for (int x = 0; x < w; x++)
+            var pixels = info.GetPixelSpan();
+            // Sample every 2nd row for speed
+            for (int y = 0; y < h; y += 2)
             {
-                double dx = x - cx, dy = y - cy;
-                int rx = (int)(cx + dx * cos - dy * sin);
-                int ry = (int)(cy + dx * sin + dy * cos);
-                if (rx >= 0 && rx < w && ry >= 0 && ry < h)
+                for (int x = 0; x < w; x++)
                 {
-                    var pixel = bmp.GetPixel(rx, ry);
-                    // Calculate grayscale: use average of RGB
-                    byte gray = (byte)((pixel.Red + pixel.Green + pixel.Blue) / 3);
-                    if (gray < 128)
-                        projection[rx]++;
+                    double dx = x - cx, dy = y - cy;
+                    int rx = (int)(cx + dx * cos - dy * sin);
+                    int ry = (int)(cy + dx * sin + dy * cos);
+                    if (rx >= 0 && rx < w && ry >= 0 && ry < h)
+                    {
+                        int idx = (ry * w + rx) * 4;
+                        byte b = pixels[idx];
+                        byte g = pixels[idx + 1];
+                        byte r = pixels[idx + 2];
+                        byte gray = (byte)((r + g + b) / 3);
+                        if (gray < 128)
+                            projection[rx]++;
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Fallback
+            for (int y = 0; y < h; y += 2)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    double dx = x - cx, dy = y - cy;
+                    int rx = (int)(cx + dx * cos - dy * sin);
+                    int ry = (int)(cy + dx * sin + dy * cos);
+                    if (rx >= 0 && rx < w && ry >= 0 && ry < h)
+                    {
+                        var pixel = bmp.GetPixel(rx, ry);
+                        byte gray = (byte)((pixel.Red + pixel.Green + pixel.Blue) / 3);
+                        if (gray < 128)
+                            projection[rx]++;
+                    }
                 }
             }
         }
@@ -390,7 +573,11 @@ public abstract class OcrBase : IReceiptOCR
     protected static readonly HashSet<string> SkipKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
         "TOTAL", "SUBTOTAL", "IVA", "DESCUENTO", "DTO.", "AHORRO", "CAMBIO",
-        "EFECTIVO", "TARJETA", "BASE IMPONIBLE", "IMPORTE", "A PAGAR", "FACTURA"
+        "EFECTIVO", "TARJETA", "BASE IMPONIBLE", "IMPORTE", "A PAGAR", "FACTURA",
+        // Table headers (Dia-style receipts)
+        "PRODUCTOS VENDIDOS", "DESCRIPCIÓN", "CANTIDAD", "PRECIO KG", "TOTAL VENTA",
+        "RESUMEN DE LA COMPRA", "FORMA DE PAGO", "DATOS DE LA OPERACIÓN",
+        "TIPO", "CUOTA", "VENTA", "OPERACION CONTACTLESS"
     };
 
     protected static bool IsSkippable(string name) =>
