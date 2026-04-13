@@ -1,10 +1,7 @@
 using System.Globalization;
-using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using Tesseract;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
+using SkiaSharp;
 using System.IO;
 
 /// <summary>
@@ -42,14 +39,14 @@ public abstract class OcrBase : IReceiptOCR
         if (!File.Exists(imagePath))
             throw new FileNotFoundException($"Image file not found: {imagePath}");
 
-        using var image = new Bitmap(imagePath);
+        using var image = SKBitmap.Decode(imagePath);
         using var processed = Preprocess(image);
 
         using var engine = new TesseractEngine(TessDataPath, "spa+eng", EngineMode.LstmOnly);
         engine.SetVariable("preserve_interword_spaces", "1");
 
         using var ms = new MemoryStream();
-        processed.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+        processed.Encode(ms, SKEncodedImageFormat.Png, 100);
         ms.Position = 0;
         using var pix = Pix.LoadFromMemory(ms.ToArray());
 
@@ -194,12 +191,12 @@ public abstract class OcrBase : IReceiptOCR
 
     // ── Preprocessing: grayscale → deskew → upscale → threshold ──────────────
 
-    private static Bitmap Preprocess(Bitmap original)
+    private static SKBitmap Preprocess(SKBitmap original)
     {
         using var gray = ToGrayscale(original);
 
         // Deskew only if image is large enough
-        using var deskewed = gray.Width > 100 && gray.Height > 100 ? Deskew(gray) : new Bitmap(gray);
+        using var deskewed = gray.Width > 100 && gray.Height > 100 ? Deskew(gray) : gray.Copy();
 
         using var upscaled = Upscale(deskewed, 2400);
         return SimpleThreshold(upscaled);
@@ -208,59 +205,65 @@ public abstract class OcrBase : IReceiptOCR
     /// <summary>
     /// Simple fixed threshold - more reliable than Otsu for receipts.
     /// </summary>
-    private static Bitmap SimpleThreshold(Bitmap src)
+    private static SKBitmap SimpleThreshold(SKBitmap src)
     {
-        var (pixels, stride) = LockRead(src);
         int w = src.Width, h = src.Height;
+        var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
 
         // Use fixed threshold of 180 (works well for black text on white paper)
         const int threshold = 180;
-        var result = new byte[stride * h];
-
         int blackCount = 0;
-        for (int i = 0; i < pixels.Length; i += 3)
+
+        for (int y = 0; y < h; y++)
         {
-            byte val = pixels[i] < threshold ? (byte)0 : (byte)255;
-            if (val == 0) blackCount++;
-            result[i] = result[i + 1] = result[i + 2] = val;
+            for (int x = 0; x < w; x++)
+            {
+                var pixel = src.GetPixel(x, y);
+                // Calculate grayscale manually: 0.2126*R + 0.7152*G + 0.0722*B
+                byte gray = (byte)(pixel.Red * 0.2126 + pixel.Green * 0.7152 + pixel.Blue * 0.0722);
+                byte val = gray < threshold ? (byte)0 : (byte)255;
+                if (val == 0) blackCount++;
+                result.SetPixel(x, y, new SKColor(val, val, val));
+            }
         }
 
         // If too few black pixels (< 0.1%), return grayscale instead
-        if (blackCount < pixels.Length * 0.001)
+        int totalPixels = w * h;
+        if (blackCount < totalPixels * 0.001)
         {
-            Array.Copy(pixels, result, pixels.Length);
+            result.Dispose();
+            return src.Copy();
         }
 
-        return CreateBitmap(result, w, h, stride);
+        return result;
     }
 
     // ── Step 1: Grayscale ────────────────────────────────────────────────────
 
-    private static Bitmap ToGrayscale(Bitmap src)
+    private static SKBitmap ToGrayscale(SKBitmap src)
     {
-        var (pixels, stride) = LockRead(src);
         int w = src.Width, h = src.Height;
-        var result = new byte[stride * h];
+        var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
 
         for (int y = 0; y < h; y++)
+        {
             for (int x = 0; x < w; x++)
             {
-                int i = y * stride + x * 3;
-                byte luma = (byte)(pixels[i + 2] * 0.2126 + pixels[i + 1] * 0.7152 + pixels[i] * 0.0722);
-                result[i] = result[i + 1] = result[i + 2] = luma;
+                var pixel = src.GetPixel(x, y);
+                byte luma = (byte)(pixel.Red * 0.2126 + pixel.Green * 0.7152 + pixel.Blue * 0.0722);
+                result.SetPixel(x, y, new SKColor(luma, luma, luma));
             }
+        }
 
-        return CreateBitmap(result, w, h, stride);
+        return result;
     }
 
     // ── Step 2: Deskew ───────────────────────────────────────────────────────
 
-    private static Bitmap Deskew(Bitmap src)
+    private static SKBitmap Deskew(SKBitmap src)
     {
         using var small = Resize(src, Math.Min(src.Width, 400), Math.Min(src.Height, 400));
-        var (pixels, stride) = LockRead(small);
-        int sw = small.Width, sh = small.Height;
-
+        
         double bestAngle = 0;
         int maxVariance = 0;
 
@@ -268,7 +271,7 @@ public abstract class OcrBase : IReceiptOCR
         {
             double angle = angleDeg / 10.0;
             double radians = angle * Math.PI / 180.0;
-            int variance = CalculateProjectionVariance(pixels, stride, sw, sh, radians);
+            int variance = CalculateProjectionVariance(small, radians);
             if (variance > maxVariance)
             {
                 maxVariance = variance;
@@ -281,7 +284,7 @@ public abstract class OcrBase : IReceiptOCR
         {
             double angle = angleDeg / 10.0;
             double radians = angle * Math.PI / 180.0;
-            int variance = CalculateProjectionVariance(pixels, stride, sw, sh, radians);
+            int variance = CalculateProjectionVariance(small, radians);
             if (variance > maxVariance)
             {
                 maxVariance = variance;
@@ -292,17 +295,19 @@ public abstract class OcrBase : IReceiptOCR
         if (Math.Abs(bestAngle) > 0.3)
             return RotateImage(src, (float)-bestAngle);
 
-        return new Bitmap(src);
+        return src.Copy();
     }
 
-    private static int CalculateProjectionVariance(byte[] pixels, int stride, int w, int h, double radians)
+    private static int CalculateProjectionVariance(SKBitmap bmp, double radians)
     {
-        double cos = Math.Cos(radians);
-        double sin = Math.Sin(radians);
+        int w = bmp.Width, h = bmp.Height;
         var projection = new int[w];
         double cx = w / 2.0, cy = h / 2.0;
+        double cos = Math.Cos(radians);
+        double sin = Math.Sin(radians);
 
         for (int y = 0; y < h; y++)
+        {
             for (int x = 0; x < w; x++)
             {
                 double dx = x - cx, dy = y - cy;
@@ -310,10 +315,14 @@ public abstract class OcrBase : IReceiptOCR
                 int ry = (int)(cy + dx * sin + dy * cos);
                 if (rx >= 0 && rx < w && ry >= 0 && ry < h)
                 {
-                    if (pixels[ry * stride + rx * 3] < 128)
+                    var pixel = bmp.GetPixel(rx, ry);
+                    // Calculate grayscale: use average of RGB
+                    byte gray = (byte)((pixel.Red + pixel.Green + pixel.Blue) / 3);
+                    if (gray < 128)
                         projection[rx]++;
                 }
             }
+        }
 
         double mean = projection.Sum() / (double)w;
         double variance = 0;
@@ -323,76 +332,50 @@ public abstract class OcrBase : IReceiptOCR
         return (int)(variance / w);
     }
 
-    private static Bitmap RotateImage(Bitmap src, float angle)
+    private static SKBitmap RotateImage(SKBitmap src, float angle)
     {
-        var dst = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
-        using var g = Graphics.FromImage(dst);
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.Clear(Color.White);
-        g.TranslateTransform(src.Width / 2f, src.Height / 2f);
-        g.RotateTransform(angle);
-        g.TranslateTransform(-src.Width / 2f, -src.Height / 2f);
-        g.DrawImage(src, 0, 0);
+        int w = src.Width, h = src.Height;
+        var dst = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
+
+        using var canvas = new SKCanvas(dst);
+        canvas.Clear(SKColors.White);
+        canvas.Translate(w / 2f, h / 2f);
+        canvas.RotateDegrees(angle);
+        canvas.Translate(-w / 2f, -h / 2f);
+        canvas.DrawBitmap(src, 0, 0);
+
         return dst;
     }
 
     // ── Step 3: Upscale ──────────────────────────────────────────────────────
 
-    private static Bitmap Upscale(Bitmap src, int targetMinSide)
+    private static SKBitmap Upscale(SKBitmap src, int targetMinSide)
     {
         int minSide = Math.Min(src.Width, src.Height);
         if (minSide >= targetMinSide)
-            return new Bitmap(src);
+            return src.Copy();
 
         float scale = (float)targetMinSide / minSide;
         int newW = Math.Max(100, (int)(src.Width * scale));
         int newH = Math.Max(100, (int)(src.Height * scale));
 
-        var dst = new Bitmap(newW, newH, PixelFormat.Format24bppRgb);
-        using var g = Graphics.FromImage(dst);
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        g.DrawImage(src, 0, 0, newW, newH);
-        return dst;
+        return Resize(src, newW, newH);
     }
 
     // ── Resize helper ────────────────────────────────────────────────────────
 
-    private static Bitmap Resize(Bitmap src, int newW, int newH)
+    private static SKBitmap Resize(SKBitmap src, int newW, int newH)
     {
-        var dst = new Bitmap(newW, newH, PixelFormat.Format24bppRgb);
-        using var g = Graphics.FromImage(dst);
-        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-        g.DrawImage(src, 0, 0, newW, newH);
+        var dst = new SKBitmap(newW, newH, SKColorType.Rgb888x, SKAlphaType.Opaque);
+        
+        using var canvas = new SKCanvas(dst);
+        using var paint = new SKPaint
+        {
+            FilterQuality = SKFilterQuality.High
+        };
+        canvas.DrawBitmap(src, new SKRect(0, 0, newW, newH), paint);
+        
         return dst;
-    }
-
-    // ── Bitmap helpers ───────────────────────────────────────────────────────
-
-    private static (byte[] pixels, int stride) LockRead(Bitmap bmp)
-    {
-        var data = bmp.LockBits(
-            new Rectangle(0, 0, bmp.Width, bmp.Height),
-            ImageLockMode.ReadOnly,
-            PixelFormat.Format24bppRgb);
-        int stride = Math.Abs(data.Stride);
-        var bytes = new byte[stride * bmp.Height];
-        Marshal.Copy(data.Scan0, bytes, 0, bytes.Length);
-        bmp.UnlockBits(data);
-        return (bytes, stride);
-    }
-
-    private static Bitmap CreateBitmap(byte[] pixels, int width, int height, int stride)
-    {
-        var bmp = new Bitmap(width, height, PixelFormat.Format24bppRgb);
-        var data = bmp.LockBits(
-            new Rectangle(0, 0, width, height),
-            ImageLockMode.WriteOnly,
-            PixelFormat.Format24bppRgb);
-        Marshal.Copy(pixels, 0, data.Scan0, pixels.Length);
-        bmp.UnlockBits(data);
-        return bmp;
     }
 
     // ── Shared constants ─────────────────────────────────────────────────────
