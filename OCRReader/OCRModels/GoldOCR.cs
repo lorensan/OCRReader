@@ -249,11 +249,60 @@ public class GoldOCR : OcrBase
                 }
             }
 
-            // Pattern D: standalone price
+            // Pattern D: Table format - product with quantity and price columns
+            // Handles: "PRODUCT  QTY  PRICE  TOTAL" or "PRODUCT  QTY  PRICE/KG  TOTAL"
+            var tableMatch = Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d'\(\)]{2,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?|U)?)\s+[\d]+[,\.]?[\d]{2}\s*€?\s*(?:€?/kg)?\s+([\d]+[,\.]?[\d]{2})\s*€?\s*[A-Z]?\s*$",
+                RegexOptions.IgnoreCase);
+            if (tableMatch.Success)
+            {
+                string name = tableMatch.Groups[1].Value.Trim();
+                string totalStr = tableMatch.Groups[3].Value;
+
+                // Fix OCR errors in price
+                totalStr = FixPriceString(totalStr);
+
+                if (!IsSkippable(name) && name.Length >= 2 &&
+                    decimal.TryParse(totalStr.Replace(',', '.'),
+                        NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
+                    price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, CleanProductName(name), price));
+                    pending = null;
+                    continue;
+                }
+            }
+
+            // Pattern E: Product with multiple prices (take the last one)
+            var multiPriceMatch = Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d'\(\)]{2,}?)\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s*€",
+                RegexOptions.IgnoreCase);
+            if (multiPriceMatch.Success)
+            {
+                string name = multiPriceMatch.Groups[1].Value.Trim();
+                string totalStr = multiPriceMatch.Groups[4].Value;
+
+                totalStr = FixPriceString(totalStr);
+
+                if (!IsSkippable(name) && name.Length >= 2 &&
+                    decimal.TryParse(totalStr.Replace(',', '.'),
+                        NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
+                    price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, CleanProductName(name), price));
+                    pending = null;
+                    continue;
+                }
+            }
+
+            // Pattern F: Standalone price with pending product name
             var standaloneMatch = Regex.Match(line, @"^(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
             if (standaloneMatch.Success && pending != null)
             {
-                if (decimal.TryParse(standaloneMatch.Groups[1].Value.Replace(',', '.'),
+                string priceStr = standaloneMatch.Groups[1].Value;
+                priceStr = FixPriceString(priceStr);
+                
+                if (decimal.TryParse(priceStr.Replace(',', '.'),
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
                     price > 0)
                 {
@@ -261,6 +310,31 @@ public class GoldOCR : OcrBase
                     pending = null;
                 }
                 continue;
+            }
+
+            // Pattern G: Price with missing comma (OCR error)
+            var missingCommaMatch = Regex.Match(line,
+                @"^(.+?)\s+([\d]{3,4})\s*€?\s*$");
+            if (missingCommaMatch.Success && !missingCommaMatch.Groups[2].Value.Contains(',') && !missingCommaMatch.Groups[2].Value.Contains('.'))
+            {
+                string name = missingCommaMatch.Groups[1].Value.Trim();
+                string priceStr = missingCommaMatch.Groups[2].Value;
+                
+                // Try inserting comma before last 2 digits
+                if (priceStr.Length >= 3)
+                {
+                    priceStr = priceStr.Insert(priceStr.Length - 2, ",");
+                    
+                    if (!IsSkippable(name) && name.Length >= 2 &&
+                        decimal.TryParse(priceStr.Replace(',', '.'),
+                            NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
+                        price > 0 && price < 10000)
+                    {
+                        items.Add(new ReceiptItem(supermarket, CleanProductName(name), price));
+                        pending = null;
+                        continue;
+                    }
+                }
             }
 
             // No price — keep as pending product
@@ -275,6 +349,25 @@ public class GoldOCR : OcrBase
         }
 
         return items;
+    }
+
+    /// <summary>
+    /// Fixes common OCR price format errors (e.g., "115" → "1,15", "099" → "0,99")
+    /// </summary>
+    private static string FixPriceString(string priceStr)
+    {
+        if (string.IsNullOrEmpty(priceStr))
+            return priceStr;
+
+        if (!priceStr.Contains(',') && !priceStr.Contains('.'))
+        {
+            if (priceStr.Length >= 3 && Regex.IsMatch(priceStr, @"^\d{3,}$"))
+            {
+                priceStr = priceStr.Insert(priceStr.Length - 2, ",");
+            }
+        }
+
+        return priceStr;
     }
 
     private static bool IsNoiseLine(string line)

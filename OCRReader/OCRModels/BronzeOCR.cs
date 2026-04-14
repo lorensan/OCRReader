@@ -9,13 +9,13 @@ public class BronzeOCR : OcrBase
     {
         var (text, confidence) = ExtractRawTextMultiPass(imagePath);
         string supermarket = ExtractSupermarket(text);
-        
+
         // Detect if this is a table-based receipt (like Dia's)
         if (IsTableFormat(text))
         {
             return ParseTableFormat(text, supermarket, confidence);
         }
-        
+
         return BasicParse(text, supermarket, confidence);
     }
 
@@ -25,8 +25,8 @@ public class BronzeOCR : OcrBase
     private static bool IsTableFormat(string text)
     {
         var upper = text.ToUpperInvariant();
-        return upper.Contains("DESCRIPCIÓN") || 
-               upper.Contains("CANTIDAD") || 
+        return upper.Contains("DESCRIPCIÓN") ||
+               upper.Contains("CANTIDAD") ||
                upper.Contains("PRODUCTOS VENDIDOS");
     }
 
@@ -39,9 +39,9 @@ public class BronzeOCR : OcrBase
         var lines = text.Split('\n');
         string? pendingName = null;
 
-        foreach (var raw in lines)
+        for (int i = 0; i < lines.Length; i++)
         {
-            var line = raw.Trim();
+            var line = lines[i].Trim();
             if (line.Length < 2) continue;
 
             // Skip headers and metadata
@@ -60,14 +60,9 @@ public class BronzeOCR : OcrBase
             if (fullRowMatch.Success)
             {
                 string name = fullRowMatch.Groups[1].Value.Trim();
-                string totalStr = fullRowMatch.Groups[3].Value; // Group 3 is now the total (last price)
+                string totalStr = fullRowMatch.Groups[3].Value;
 
-                // Fix OCR errors: insert comma if missing (e.g., "099" → "0,99")
-                if (!totalStr.Contains(',') && !totalStr.Contains('.'))
-                {
-                    if (totalStr.Length >= 3)
-                        totalStr = totalStr.Insert(totalStr.Length - 2, ",");
-                }
+                totalStr = FixPriceFormat(totalStr);
 
                 if (!IsSkippable(name) && name.Length >= 3 &&
                     decimal.TryParse(totalStr.Replace(',', '.'),
@@ -88,11 +83,7 @@ public class BronzeOCR : OcrBase
                 string name = weightMatch.Groups[1].Value.Trim();
                 string totalStr = weightMatch.Groups[3].Value;
 
-                if (!totalStr.Contains(',') && !totalStr.Contains('.'))
-                {
-                    if (totalStr.Length >= 3)
-                        totalStr = totalStr.Insert(totalStr.Length - 2, ",");
-                }
+                totalStr = FixPriceFormat(totalStr);
 
                 if (!IsSkippable(name) && name.Length >= 3 &&
                     decimal.TryParse(totalStr.Replace(',', '.'),
@@ -105,27 +96,64 @@ public class BronzeOCR : OcrBase
                 }
             }
 
-            // Pattern 1c: Multi-line product (name on one line, details on next)
-            // Matches: "TOSTADAS                1ud      1,15€     115€ A"
-            var multiLineMatch = System.Text.RegularExpressions.Regex.Match(line,
-                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)]{3,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg)?)\s+[\d]+[,\.]?[\d]{2}\s*€?\s+([\d]+[,\.]?[\d]{2})\s*€");
-            if (multiLineMatch.Success)
+            // Pattern 1c: Simplified table row - product with quantity and price
+            var simpleTableMatch = System.Text.RegularExpressions.Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)\d]{2,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?|U)?)\s+([\d]+[,\.]?[\d]{2})\s*€?\s*[A-Z]?\s*$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (simpleTableMatch.Success)
             {
-                string name = multiLineMatch.Groups[1].Value.Trim();
-                string totalStr = multiLineMatch.Groups[3].Value;
+                string name = simpleTableMatch.Groups[1].Value.Trim();
+                string totalStr = simpleTableMatch.Groups[3].Value;
 
-                if (!totalStr.Contains(',') && !totalStr.Contains('.'))
-                {
-                    if (totalStr.Length >= 3)
-                        totalStr = totalStr.Insert(totalStr.Length - 2, ",");
-                }
+                totalStr = FixPriceFormat(totalStr);
 
-                if (!IsSkippable(name) && name.Length >= 3 &&
+                if (!IsSkippable(name) && name.Length >= 2 &&
                     decimal.TryParse(totalStr.Replace(',', '.'),
                         System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out decimal price) &&
                     price > 0 && price < 10000)
                 {
                     items.Add(new ReceiptItem(supermarket, name, price, confidence * 0.85));
+                    pendingName = null;
+                    continue;
+                }
+            }
+
+            // Pattern 1d: Product name followed by multiple prices (take the last one as total)
+            var multiPriceMatch = System.Text.RegularExpressions.Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)\d]{2,}?)\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s*€");
+            if (multiPriceMatch.Success)
+            {
+                string name = multiPriceMatch.Groups[1].Value.Trim();
+                string totalStr = multiPriceMatch.Groups[4].Value;
+
+                totalStr = FixPriceFormat(totalStr);
+
+                if (!IsSkippable(name) && name.Length >= 2 &&
+                    decimal.TryParse(totalStr.Replace(',', '.'),
+                        System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out decimal price) &&
+                    price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, name, price, confidence * 0.8));
+                    pendingName = null;
+                    continue;
+                }
+            }
+
+            // Pattern 1e: Very simple pattern - product name ending with price
+            var simplePriceMatch = System.Text.RegularExpressions.Regex.Match(line,
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)\d]{2,}?)\s+([\d]+[,\.][\d]{2})\s*€?\s*$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (simplePriceMatch.Success)
+            {
+                string name = simplePriceMatch.Groups[1].Value.Trim();
+                string priceStr = simplePriceMatch.Groups[2].Value;
+
+                if (!IsSkippable(name) && name.Length >= 2 &&
+                    decimal.TryParse(priceStr.Replace(',', '.'),
+                        System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out decimal price) &&
+                    price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, name, price, confidence * 0.75));
                     pendingName = null;
                     continue;
                 }
@@ -148,11 +176,7 @@ public class BronzeOCR : OcrBase
                 if (continuationMatch.Success)
                 {
                     string totalStr = continuationMatch.Groups[2].Value;
-                    if (!totalStr.Contains(',') && !totalStr.Contains('.'))
-                    {
-                        if (totalStr.Length >= 3)
-                            totalStr = totalStr.Insert(totalStr.Length - 2, ",");
-                    }
+                    totalStr = FixPriceFormat(totalStr);
 
                     if (decimal.TryParse(totalStr.Replace(',', '.'),
                         System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out decimal price) &&
@@ -165,25 +189,78 @@ public class BronzeOCR : OcrBase
                 }
             }
 
+            // Pattern 4: Standalone price line (might be a product from previous line)
+            var standalonePriceMatch = System.Text.RegularExpressions.Regex.Match(line,
+                @"^([\d]+[,\.][\d]{2})\s*€\s*[A-Z]?\s*$");
+            if (standalonePriceMatch.Success && pendingName != null)
+            {
+                string priceStr = standalonePriceMatch.Groups[1].Value;
+                priceStr = FixPriceFormat(priceStr);
+
+                if (decimal.TryParse(priceStr.Replace(',', '.'),
+                    System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out decimal price) &&
+                    price > 0 && price < 10000)
+                {
+                    items.Add(new ReceiptItem(supermarket, pendingName, price, confidence * 0.7));
+                    pendingName = null;
+                    continue;
+                }
+            }
+
             // Negative price lines (discounts/promotions)
             var negativeMatch = System.Text.RegularExpressions.Regex.Match(line,
                 @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%]+?)\s+(-[\d]+[,\.]?[\d]{2})\s*€");
             if (negativeMatch.Success)
             {
-                // Skip discounts - they're not products
                 pendingName = null;
                 continue;
+            }
+
+            // If no pattern matched and this looks like a product name, save it as pending
+            if (!IsSkippable(line) && !IsMetadataLine(line) && line.Length >= 2)
+            {
+                if (System.Text.RegularExpressions.Regex.IsMatch(line, @"[A-ZÁÉÍÓÚÑÜ]", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                {
+                    pendingName = line;
+                }
+                else
+                {
+                    pendingName = null;
+                }
+            }
+            else
+            {
+                pendingName = null;
             }
         }
 
         return items;
     }
 
+    /// <summary>
+    /// Fixes common OCR price format errors (e.g., "115" → "1,15", "099" → "0,99")
+    /// </summary>
+    private static string FixPriceFormat(string priceStr)
+    {
+        if (string.IsNullOrEmpty(priceStr))
+            return priceStr;
+
+        if (!priceStr.Contains(',') && !priceStr.Contains('.'))
+        {
+            if (priceStr.Length >= 3 && System.Text.RegularExpressions.Regex.IsMatch(priceStr, @"^\d{3,}$"))
+            {
+                priceStr = priceStr.Insert(priceStr.Length - 2, ",");
+            }
+        }
+
+        return priceStr;
+    }
+
     private static bool IsTableHeader(string line)
     {
         var upper = line.ToUpperInvariant();
-        return upper.Contains("DESCRIPCIÓN") || 
-               upper.Contains("CANTIDAD") || 
+        return upper.Contains("DESCRIPCIÓN") ||
+               upper.Contains("CANTIDAD") ||
                upper.Contains("PRECIO KG") ||
                upper.Contains("TOTAL") && upper.Contains("VENTA");
     }

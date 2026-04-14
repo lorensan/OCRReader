@@ -265,6 +265,8 @@ public abstract class OcrBase : IReceiptOCR
 
         // Reduce upscale target to reasonable size for Tesseract
         using var upscaled = Upscale(deskewed, 1200);
+        
+        // Use simple threshold (fast and effective with improved parsing)
         return SimpleThresholdFast(upscaled);
     }
 
