@@ -30,6 +30,47 @@ public abstract class OcrBase : IReceiptOCR
         return $"[Confidence: {confidence:P2}]\n\n{text}";
     }
 
+    /// <summary>
+    /// Debug method to save preprocessed image to disk for analysis.
+    /// </summary>
+    public void SavePreprocessedImage(string imagePath, string outputPath)
+    {
+        if (!File.Exists(imagePath))
+            throw new FileNotFoundException($"Image file not found: {imagePath}");
+
+        using var original = SKBitmap.Decode(imagePath);
+        using var preprocessed = PreprocessForDebug(original);
+        using var encoded = preprocessed.Encode(SKEncodedImageFormat.Png, 100);
+        File.WriteAllBytes(outputPath, encoded.ToArray());
+    }
+
+    private static SKBitmap PreprocessForDebug(SKBitmap original)
+    {
+        // Same as Preprocess but returns the intermediate grayscale image for debugging
+        int maxInputSide = 2000;
+        int maxOrigSide = Math.Max(original.Width, original.Height);
+        SKBitmap limited;
+        if (maxOrigSide > maxInputSide)
+        {
+            float scale = (float)maxInputSide / maxOrigSide;
+            int newW = Math.Max(100, (int)(original.Width * scale));
+            int newH = Math.Max(100, (int)(original.Height * scale));
+            limited = Resize(original, newW, newH);
+        }
+        else
+        {
+            limited = original.Copy();
+        }
+
+        using var _limited = limited;
+        using var gray = ToGrayscaleFast(limited);
+        using var deskewed = gray.Width > 100 && gray.Height > 100 ? DeskewFast(gray) : gray.Copy();
+        using var upscaled = Upscale(deskewed, 1200);
+
+        // Try multiple thresholds and save all
+        return SimpleThresholdFast(upscaled);
+    }
+
     // ── Tesseract OCR extraction ─────────────────────────────────────────────
 
     protected (string Text, double Confidence) ExtractRawText(string imagePath)
@@ -265,9 +306,264 @@ public abstract class OcrBase : IReceiptOCR
 
         // Reduce upscale target to reasonable size for Tesseract
         using var upscaled = Upscale(deskewed, 1200);
-        
-        // Use simple threshold (fast and effective with improved parsing)
-        return SimpleThresholdFast(upscaled);
+
+        // Try multiple threshold strategies and return the one most likely to preserve text
+        return SmartThreshold(upscaled);
+    }
+
+    /// <summary>
+    /// Intelligent threshold selection: tries multiple approaches and picks the best.
+    /// </summary>
+    private static SKBitmap SmartThreshold(SKBitmap src)
+    {
+        // Strategy 1: Try fixed threshold of 180 (original - proven to work)
+        var fixedResult = TryFixedThreshold(src, 180);
+        var fixedScore = ScoreThresholdResult(fixedResult);
+
+        // Strategy 2: Try fixed threshold of 150 (more conservative)
+        var conservativeResult = TryFixedThreshold(src, 150);
+        var conservativeScore = ScoreThresholdResult(conservativeResult);
+
+        // Strategy 3: Try Otsu's method
+        var otsuResult = TryOtsuThreshold(src);
+        var otsuScore = ScoreThresholdResult(otsuResult);
+
+        // Pick the best scoring result
+        var bestScore = Math.Max(fixedScore, Math.Max(conservativeScore, otsuScore));
+
+        if (bestScore == fixedScore)
+        {
+            conservativeResult.Dispose();
+            otsuResult.Dispose();
+            return fixedResult;
+        }
+        else if (bestScore == conservativeScore)
+        {
+            fixedResult.Dispose();
+            otsuResult.Dispose();
+            return conservativeResult;
+        }
+        else
+        {
+            fixedResult.Dispose();
+            conservativeResult.Dispose();
+            return otsuResult;
+        }
+    }
+
+    private static SKBitmap TryOtsuThreshold(SKBitmap src)
+    {
+        int w = src.Width, h = src.Height;
+        var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
+
+        var srcInfo = src.PeekPixels();
+        var dstInfo = result.PeekPixels();
+
+        if (srcInfo != null && dstInfo != null)
+        {
+            var srcBytes = srcInfo.GetPixelSpan();
+            var dstBytes = dstInfo.GetPixelSpan();
+            int totalPixels = w * h;
+
+            var histogram = new int[256];
+            unsafe
+            {
+                fixed (byte* srcPtr = srcBytes)
+                {
+                    for (int i = 0; i < totalPixels; i++)
+                    {
+                        int idx = i * 4;
+                        byte r = srcPtr[idx + 2];
+                        byte g = srcPtr[idx + 1];
+                        byte b = srcPtr[idx];
+                        histogram[(r + g + b) / 3]++;
+                    }
+                }
+            }
+
+            int threshold = CalculateOtsuThreshold(histogram, totalPixels);
+            threshold = Math.Max(100, Math.Min(220, threshold));
+            int blackCount = 0;
+
+            unsafe
+            {
+                fixed (byte* srcPtr = srcBytes, dstPtr = dstBytes)
+                {
+                    for (int i = 0; i < totalPixels; i++)
+                    {
+                        int idx = i * 4;
+                        byte r = srcPtr[idx + 2];
+                        byte g = srcPtr[idx + 1];
+                        byte b = srcPtr[idx];
+                        byte gray = (byte)((r + g + b) / 3);
+                        byte val = gray < threshold ? (byte)0 : (byte)255;
+                        if (val == 0) blackCount++;
+
+                        dstPtr[idx] = val;
+                        dstPtr[idx + 1] = val;
+                        dstPtr[idx + 2] = val;
+                        dstPtr[idx + 3] = 0;
+                    }
+                }
+            }
+
+            if (blackCount < totalPixels * 0.001)
+            {
+                result.Dispose();
+                return src.Copy();
+            }
+        }
+
+        return result;
+    }
+
+    private static SKBitmap TryFixedThreshold(SKBitmap src, int threshold)
+    {
+        int w = src.Width, h = src.Height;
+        var result = new SKBitmap(w, h, SKColorType.Rgb888x, SKAlphaType.Opaque);
+
+        var srcInfo = src.PeekPixels();
+        var dstInfo = result.PeekPixels();
+
+        if (srcInfo != null && dstInfo != null)
+        {
+            var srcBytes = srcInfo.GetPixelSpan();
+            var dstBytes = dstInfo.GetPixelSpan();
+            int totalPixels = w * h;
+            int blackCount = 0;
+
+            unsafe
+            {
+                fixed (byte* srcPtr = srcBytes, dstPtr = dstBytes)
+                {
+                    for (int i = 0; i < totalPixels; i++)
+                    {
+                        int idx = i * 4;
+                        byte r = srcPtr[idx + 2];
+                        byte g = srcPtr[idx + 1];
+                        byte b = srcPtr[idx];
+                        byte gray = (byte)((r + g + b) / 3);
+                        byte val = gray < threshold ? (byte)0 : (byte)255;
+                        if (val == 0) blackCount++;
+
+                        dstPtr[idx] = val;
+                        dstPtr[idx + 1] = val;
+                        dstPtr[idx + 2] = val;
+                        dstPtr[idx + 3] = 0;
+                    }
+                }
+            }
+
+            if (blackCount < totalPixels * 0.001)
+            {
+                result.Dispose();
+                return src.Copy();
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Score a thresholded image based on how well it preserves text structure.
+    /// Higher score = better text preservation.
+    /// </summary>
+    private static double ScoreThresholdResult(SKBitmap bitmap)
+    {
+        int w = bitmap.Width, h = bitmap.Height;
+        var info = bitmap.PeekPixels();
+        if (info == null) return 0;
+
+        var pixels = info.GetPixelSpan();
+        int totalPixels = w * h;
+        int blackCount = 0;
+        int horizontalEdges = 0;
+        int verticalEdges = 0;
+
+        unsafe
+        {
+            fixed (byte* ptr = pixels)
+            {
+                for (int i = 0; i < totalPixels; i++)
+                {
+                    int idx = i * 4;
+                    if (ptr[idx] == 0) blackCount++; // Black pixel
+
+                    // Count horizontal edges (transitions from black to white)
+                    if (i % w > 0)
+                    {
+                        int prevIdx = (i - 1) * 4;
+                        if ((ptr[idx] == 0 && ptr[prevIdx] == 255) ||
+                            (ptr[idx] == 255 && ptr[prevIdx] == 0))
+                            horizontalEdges++;
+                    }
+
+                    // Count vertical edges
+                    if (i >= w)
+                    {
+                        int aboveIdx = (i - w) * 4;
+                        if ((ptr[idx] == 0 && ptr[aboveIdx] == 255) ||
+                            (ptr[idx] == 255 && ptr[aboveIdx] == 0))
+                            verticalEdges++;
+                    }
+                }
+            }
+        }
+
+        double blackRatio = blackCount / (double)totalPixels;
+        double edgeRatio = (horizontalEdges + verticalEdges) / (double)(totalPixels * 2);
+
+        // Good text images have:
+        // - 5-30% black pixels (text vs background)
+        // - High edge density (sharp text boundaries)
+        double score = 0;
+        if (blackRatio >= 0.05 && blackRatio <= 0.30)
+            score += 50;
+        else if (blackRatio >= 0.01 && blackRatio <= 0.50)
+            score += 25;
+
+        score += edgeRatio * 1000; // Edge density bonus
+
+        return score;
+    }
+
+    /// <summary>
+    /// Calculate optimal threshold using Otsu's method.
+    /// </summary>
+    private static int CalculateOtsuThreshold(int[] histogram, int totalPixels)
+    {
+        double sum = 0;
+        for (int i = 0; i < 256; i++)
+            sum += i * histogram[i];
+
+        double sumB = 0;
+        int wB = 0;
+        double varMax = 0;
+        int threshold = 128;
+
+        for (int t = 0; t < 256; t++)
+        {
+            wB += histogram[t];
+            if (wB == 0) continue;
+
+            int wF = totalPixels - wB;
+            if (wF == 0) break;
+
+            sumB += t * histogram[t];
+
+            double mB = sumB / wB;
+            double mF = (sum - sumB) / wF;
+
+            double varBetween = wB * wF * (mB - mF) * (mB - mF);
+
+            if (varBetween > varMax)
+            {
+                varMax = varBetween;
+                threshold = t;
+            }
+        }
+
+        return threshold;
     }
 
     /// <summary>
@@ -579,7 +875,11 @@ public abstract class OcrBase : IReceiptOCR
         // Table headers (Dia-style receipts)
         "PRODUCTOS VENDIDOS", "DESCRIPCIÓN", "CANTIDAD", "PRECIO KG", "TOTAL VENTA",
         "RESUMEN DE LA COMPRA", "FORMA DE PAGO", "DATOS DE LA OPERACIÓN",
-        "TIPO", "CUOTA", "VENTA", "OPERACION CONTACTLESS"
+        "TIPO", "CUOTA", "VENTA", "OPERACION CONTACTLESS",
+        // Tax breakdown
+        "DESGLOSE", "BASE", "IVA", "ENTREGA",
+        // Footer text
+        "GRACIAS", "DEVOLUCIONES", "ATENDIDO", "VISITA"
     };
 
     protected static bool IsSkippable(string name) =>

@@ -10,13 +10,44 @@ public class BronzeOCR : OcrBase
         var (text, confidence) = ExtractRawTextMultiPass(imagePath);
         string supermarket = ExtractSupermarket(text);
 
-        // Detect if this is a table-based receipt (like Dia's)
+        // Detect if this is a table-based receipt (like Dia or Moises)
         if (IsTableFormat(text))
         {
             return ParseTableFormat(text, supermarket, confidence);
         }
 
         return BasicParse(text, supermarket, confidence);
+    }
+
+    protected override string ExtractSupermarket(string text)
+    {
+        var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        
+        // First check for known supermarkets in the first 10 lines
+        foreach (var line in lines.Take(10))
+        {
+            string upper = line.ToUpperInvariant().Trim();
+            foreach (string market in KnownSupermarkets)
+                if (upper.Contains(market))
+                    return market;
+        }
+        
+        // If no known supermarket found, try to extract the store name from first line
+        foreach (var line in lines.Take(6))
+        {
+            string trimmed = line.Trim();
+            if (trimmed.Length > 3 && trimmed.Length < 50)
+            {
+                // Check if it looks like a store name (mostly letters)
+                int letterCount = trimmed.Count(char.IsLetter);
+                if (letterCount > trimmed.Length * 0.5)
+                {
+                    return trimmed;
+                }
+            }
+        }
+        
+        return "DESCONOCIDO";
     }
 
     /// <summary>
@@ -27,7 +58,8 @@ public class BronzeOCR : OcrBase
         var upper = text.ToUpperInvariant();
         return upper.Contains("DESCRIPCIÓN") ||
                upper.Contains("CANTIDAD") ||
-               upper.Contains("PRODUCTOS VENDIDOS");
+               upper.Contains("PRODUCTOS VENDIDOS") ||
+               upper.Contains("ARTICULO");
     }
 
     /// <summary>
@@ -53,8 +85,9 @@ public class BronzeOCR : OcrBase
 
             // Pattern 1: "PRODUCT  QTY  PRICE  TOTAL  VAT" (full table row)
             // Match the LAST price on the line (the total column)
+            // Updated to handle both € and non-€ formats
             var fullRowMatch = System.Text.RegularExpressions.Regex.Match(line,
-                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d'\(\)]{3,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?)?)\s+[\d]+[,\.]?[\d]{2}\s*€?\s+([\d]+[,\.]?[\d]{2})\s*€",
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%\d'\(\)\,]{3,}?)\s+(\d[\d\,\.]*\s*(?:ud|kg|u\.?d\.?)?)\s+[\d]+[,\.]?[\d]{2}\s*€?\s+([\d]+[,\.]?[\d]{2})\s*€?\s*$",
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
             if (fullRowMatch.Success)
@@ -119,8 +152,9 @@ public class BronzeOCR : OcrBase
             }
 
             // Pattern 1d: Product name followed by multiple prices (take the last one as total)
+            // Updated to handle both € and non-€ formats
             var multiPriceMatch = System.Text.RegularExpressions.Regex.Match(line,
-                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)\d]{2,}?)\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s*€");
+                @"^([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\s\&\.\-\%'\(\)\d\,]{2,}?)\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s+([\d]+[,\.]?[\d]{2})\s*€?\s*$");
             if (multiPriceMatch.Success)
             {
                 string name = multiPriceMatch.Groups[1].Value.Trim();
@@ -147,6 +181,13 @@ public class BronzeOCR : OcrBase
             {
                 string name = simplePriceMatch.Groups[1].Value.Trim();
                 string priceStr = simplePriceMatch.Groups[2].Value;
+
+                // Skip if name is just a percentage (tax breakdown)
+                if (System.Text.RegularExpressions.Regex.IsMatch(name, @"^\d+[,\.]\d{2}%$"))
+                {
+                    pendingName = null;
+                    continue;
+                }
 
                 if (!IsSkippable(name) && name.Length >= 2 &&
                     decimal.TryParse(priceStr.Replace(',', '.'),
@@ -262,16 +303,20 @@ public class BronzeOCR : OcrBase
         return upper.Contains("DESCRIPCIÓN") ||
                upper.Contains("CANTIDAD") ||
                upper.Contains("PRECIO KG") ||
-               upper.Contains("TOTAL") && upper.Contains("VENTA");
+               upper.Contains("TOTAL") && upper.Contains("VENTA") ||
+               upper.Trim() == "ARTICULO" ||
+               upper.Trim() == "PVP";
     }
 
     private static bool IsMetadataLine(string line)
     {
         var upper = line.ToUpperInvariant().Trim();
         if (upper.Length < 2) return true;
-        if (System.Text.RegularExpressions.Regex.IsMatch(upper, @"^[\d\s,\.\-\*\/\(\)x×]+$")) return true;
-        if (upper.Contains("TOTAL") || upper.Contains("SUBTOTAL") || upper.Contains("IVA")) return true;
+        if (System.Text.RegularExpressions.Regex.IsMatch(upper, @"^[\d\s,\.\-\*\/\(\)x×\+\:]+$")) return true;
+        if (upper.Contains("TOTAL :") || upper.Contains("ENTREGA") || upper.Contains("CAMBIO")) return true;
         if (upper.Contains("TARJETA") || upper.Contains("EFECTIVO")) return true;
+        if (upper.Contains("DESGLOSE") || upper.Contains("TIPO") || upper.Contains("BASE") || upper.Contains("IVA")) return true;
+        if (upper.Contains("GRACIAS") || upper.Contains("DEVOLUCIONES") || upper.Contains("ATENDIDO")) return true;
         return false;
     }
 }

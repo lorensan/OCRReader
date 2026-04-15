@@ -68,10 +68,8 @@ public class SilverOCR : OcrBase
             if (upper.Length < 3) continue;
             foreach (string market in KnownSupermarkets)
             {
-                if (upper.Length >= market.Length)
-                    for (int i = 0; i <= upper.Length - market.Length; i++)
-                        if (LevenshteinDistance(upper.Substring(i, market.Length), market) <= 2) return market;
-                else if (LevenshteinDistance(upper, market) <= 3) return market;
+                // Match whole word only, not substrings (e.g., "DIA" should not match "GUADAIRA")
+                if (Regex.IsMatch(upper, $@"\b{Regex.Escape(market)}\b")) return market;
             }
         }
         return lines.FirstOrDefault(l => l.Trim().Length > 3)?.Trim() ?? "DESCONOCIDO";

@@ -130,6 +130,10 @@ public static class MergeOCRResult
         if (Regex.IsMatch(name.Trim(), @"^[\d\s,\.\-]+$"))
             return false;
 
+        // Must not be just a percentage (e.g., "21,00%")
+        if (Regex.IsMatch(name.Trim(), @"^[\d]+[,\.][\d]{2}%$"))
+            return false;
+
         // Must be at least 2 characters
         if (name.Trim().Length < 2)
             return false;

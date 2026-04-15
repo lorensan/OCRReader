@@ -149,7 +149,7 @@ public class GoldOCR : OcrBase
                     return canonical;
         }
 
-        // Fuzzy match
+        // Fuzzy match with word boundaries to avoid partial matches
         foreach (var line in lines.Take(8))
         {
             string upper = line.Trim().ToUpperInvariant();
@@ -157,19 +157,9 @@ public class GoldOCR : OcrBase
 
             foreach (string market in KnownSupermarkets)
             {
-                if (upper.Length >= market.Length)
-                {
-                    for (int i = 0; i <= upper.Length - market.Length; i++)
-                    {
-                        string segment = upper.Substring(i, market.Length);
-                        if (LevenshteinDistance(segment, market) <= 2)
-                            return market;
-                    }
-                }
-                else if (LevenshteinDistance(upper, market) <= 3)
-                {
+                // Match whole word only, not substrings (e.g., "DIA" should not match "GUADAIRA")
+                if (Regex.IsMatch(upper, $@"\b{Regex.Escape(market)}\b"))
                     return market;
-                }
             }
         }
 
@@ -393,7 +383,14 @@ public class GoldOCR : OcrBase
     private static string CleanProductName(string name)
     {
         name = Regex.Replace(name, @"^[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ]+", "");
-        name = Regex.Replace(name, @"[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ%\)]+$", "");
+        name = Regex.Replace(name, @"[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ%\)\.\-]+$", "");
+        
+        // Remove embedded quantities and prices from product names
+        // Pattern: remove things like "1,00 0,99" or "1.00 2.50" at the end
+        name = Regex.Replace(name, @"\s+\d[\d,\.]{0,6}\s+\d[\d,\.]{0,6}\s*$", "");
+        name = Regex.Replace(name, @"\s+\d[\d,\.]{0,6}\s*$", "");
+        
+        // Normalize multiple spaces
         name = Regex.Replace(name, @"\s{2,}", " ");
         return name.Trim();
     }

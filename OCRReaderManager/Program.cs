@@ -57,6 +57,7 @@ internal class Program
         Console.WriteLine("========================================");
         Console.WriteLine("  OCR Receipt Processor");
         Console.WriteLine("========================================\n");
+
         Console.WriteLine($"Found {imageFiles.Count} image(s) to process.\n");
 
         foreach (var imagePath in imageFiles)
