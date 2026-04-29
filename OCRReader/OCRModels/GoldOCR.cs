@@ -118,18 +118,34 @@ public class GoldOCR : OcrBase
         ["MERCAD0NA"] = "MERCADONA",
         ["MERCADON A"] = "MERCADONA",
         ["MERCAOONA"] = "MERCADONA",
+        ["MERCAD0N A"] = "MERCADONA",
         ["CARRE FOUR"] = "CARREFOUR",
         ["CARREF0UR"] = "CARREFOUR",
         ["CARREFQUR"] = "CARREFOUR",
+        ["CARRE FQUR"] = "CARREFOUR",
         ["L1DL"] = "LIDL",
         ["LlDL"] = "LIDL",
+        ["LIDL"] = "LIDL",
         ["ALD1"] = "ALDI",
         ["D1A"] = "DIA",
+        ["DlA"] = "DIA",
         ["ER0SKI"] = "EROSKI",
+        ["EROSK1"] = "EROSKI",
         ["ALCAMP0"] = "ALCAMPO",
+        ["ALCAMPO"] = "ALCAMPO",
         ["EL CORTE INGLES"] = "EL CORTE INGLÉS",
+        ["EL CORTE 1NGLES"] = "EL CORTE INGLÉS",
         ["HIPERCQR"] = "HIPERCOR",
+        ["HIPERC0R"] = "HIPERCOR",
         ["FAM1LY CASH"] = "FAMILY CASH",
+        ["FAMILY CASH"] = "FAMILY CASH",
+        ["SUPERCQR"] = "SUPERCOR",
+        ["SUPERC0R"] = "SUPERCOR",
+        ["SPAR"] = "SPAR",
+        ["CONSUM"] = "CONSUM",
+        ["CAPRABO"] = "CAPRABO",
+        ["BONPREU"] = "BONPREU",
+        ["GADIS"] = "GADIS",
     };
 
     private string NormalizeSupermarket(string text)
@@ -198,7 +214,38 @@ public class GoldOCR : OcrBase
                 continue;
             }
 
-            // Pattern A: "N x ( PRICE )" — multi-quantity
+            // Check for weight-based item pattern (current line is weight/kg info)
+            var weightMatch = Regex.Match(line,
+                @"^([\d]+[,\.]\d{3})\s*kg\s+([\d]+[,\.][\d]{2})\s*€/kg\s+(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
+            if (weightMatch.Success && pending != null)
+            {
+                if (decimal.TryParse(weightMatch.Groups[3].Value.Replace(',', '.'),
+                    NumberStyles.Number, CultureInfo.InvariantCulture, out decimal totalPrice) &&
+                    Math.Abs(totalPrice) > 0)
+                {
+                    items.Add(new ReceiptItem(supermarket, CleanProductName(pending), totalPrice));
+                    pending = null;
+                }
+                continue;
+            }
+
+            // Pattern A: "N x ( PRICE )   TOTAL" — multi-quantity with total
+            var qtyTotalMatch = Regex.Match(line,
+                @"^(\d+)\s*[xX×]\s*\(?\s*([\d]+[,\.][\d]{2})\s*\)?\s+(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
+            if (qtyTotalMatch.Success)
+            {
+                string name = pending ?? $"Producto {qtyTotalMatch.Groups[1].Value}x";
+                if (decimal.TryParse(qtyTotalMatch.Groups[3].Value.Replace(',', '.'),
+                    NumberStyles.Number, CultureInfo.InvariantCulture, out decimal total) &&
+                    Math.Abs(total) > 0)
+                {
+                    items.Add(new ReceiptItem(supermarket, CleanProductName(name), total));
+                    pending = null;
+                }
+                continue;
+            }
+
+            // Pattern B: "N x ( PRICE )" — multi-quantity without total
             var qtyMatch = Regex.Match(line,
                 @"^(\d+)\s*[xX×]\s*\(?\s*([\d]+[,\.][\d]{2})\s*\)?");
             if (qtyMatch.Success && pending != null)
@@ -213,7 +260,23 @@ public class GoldOCR : OcrBase
                 continue;
             }
 
-            // Pattern B: "PRODUCT   PRICE" (2+ spaces)
+            // Pattern C: "N x PRICE   TOTAL" — alternative format without parentheses
+            var qtyAltMatch = Regex.Match(line,
+                @"^(\d+)\s*[xX×]\s+([\d]+[,\.][\d]{2})\s+(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
+            if (qtyAltMatch.Success)
+            {
+                string name = pending ?? $"Producto {qtyAltMatch.Groups[1].Value}x";
+                if (decimal.TryParse(qtyAltMatch.Groups[3].Value.Replace(',', '.'),
+                    NumberStyles.Number, CultureInfo.InvariantCulture, out decimal total) &&
+                    Math.Abs(total) > 0)
+                {
+                    items.Add(new ReceiptItem(supermarket, CleanProductName(name), total));
+                    pending = null;
+                }
+                continue;
+            }
+
+            // Pattern D: "PRODUCT   PRICE" (2+ spaces)
             var columnMatch = Regex.Match(line,
                 @"^(.+?)\s{2,}(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
             if (columnMatch.Success)
@@ -223,7 +286,7 @@ public class GoldOCR : OcrBase
                 if (!IsSkippable(name) &&
                     decimal.TryParse(priceStr,
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
-                    price > 0 && price < 10000)
+                    Math.Abs(price) > 0 && Math.Abs(price) < 10000)
                 {
                     items.Add(new ReceiptItem(supermarket, CleanProductName(name), price));
                     pending = null;
@@ -231,7 +294,7 @@ public class GoldOCR : OcrBase
                 }
             }
 
-            // Pattern C: "PRODUCT PRICE" (single space, loose match)
+            // Pattern E: "PRODUCT PRICE" (single space, loose match)
             var looseMatch = Regex.Match(line,
                 @"^(.+?)\s+([\d]{1,5}[,\.][\d]{2})\s*€?\s*$");
             if (looseMatch.Success)
@@ -249,13 +312,13 @@ public class GoldOCR : OcrBase
                 }
             }
 
-            // Pattern D: standalone price
+            // Pattern F: standalone price
             var standaloneMatch = Regex.Match(line, @"^(-?[\d]+[,\.][\d]{2})\s*€?\s*$");
             if (standaloneMatch.Success && pending != null)
             {
                 if (decimal.TryParse(standaloneMatch.Groups[1].Value.Replace(',', '.'),
                         NumberStyles.Number, CultureInfo.InvariantCulture, out decimal price) &&
-                    price > 0)
+                    Math.Abs(price) > 0)
                 {
                     items.Add(new ReceiptItem(supermarket, CleanProductName(pending), price));
                     pending = null;
@@ -286,6 +349,40 @@ public class GoldOCR : OcrBase
         return false;
     }
 
+    private static bool IsSectionHeader(string line)
+    {
+        var upper = line.ToUpperInvariant().Trim();
+        if (SectionHeaders.Contains(upper)) return true;
+        if (Regex.IsMatch(upper, @"^[\-=\*]{5,}$")) return true;
+        if (Regex.IsMatch(upper, @"^\d{8,}$")) return true;
+        // Detect category headers (uppercase, no price, short)
+        if (upper.Length >= 3 && upper.Length <= 20 && !upper.Contains('€') &&
+            !Regex.IsMatch(upper, @"[\d]+[,\.][\d]{2}"))
+        {
+            var words = upper.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length <= 2 && words.All(w => w.Length <= 15))
+            {
+                return CategoryKeywords.Any(kw => upper.Contains(kw));
+            }
+        }
+        return false;
+    }
+
+    private static readonly HashSet<string> SectionHeaders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SUBTOTAL", "TOTAL", "TOTAL A PAGAR", "IMPORTE", "A PAGAR",
+        "BASE IMPONIBLE", "IVA", "DESCUENTO", "DTO.", "AHORRO",
+        "EFECTIVO", "TARJETA", "CAMBIO", "PAGO", "FACTURA",
+        "DESCRIPCIÓN", "P. UNIT", "IMPORTE"
+    };
+
+    private static readonly string[] CategoryKeywords =
+    [
+        "FRESCOS", "ALIMENTACION", "PERFUMERIA", "HOGAR", "BEBIDAS",
+        "LACTEOS", "CHARCUTERIA", "FRUTAS", "VERDURAS", "CARNES",
+        "PESCADOS", "PANADERIA", "CONGELADOS", "LIMPIEZA", "DROGUERIA"
+    ];
+
     private static bool IsMetadataLine(string line)
     {
         var upper = line.ToUpperInvariant();
@@ -300,7 +397,7 @@ public class GoldOCR : OcrBase
     private static string CleanProductName(string name)
     {
         name = Regex.Replace(name, @"^[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ]+", "");
-        name = Regex.Replace(name, @"[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ%\)]+$", "");
+        name = Regex.Replace(name, @"[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑüÜ%\-\(\)\.\/]+", " ");
         name = Regex.Replace(name, @"\s{2,}", " ");
         return name.Trim();
     }
@@ -392,6 +489,22 @@ public class GoldOCR : OcrBase
         "PRINGLES", "CARRILLADA", "PECHUGA PAVO",
         "SALSA SOJA", "HEINZ", "CREMA YORK",
         "BOLSA", "ROLLS", "BANANA GRANEL",
+        "NATILLAS", "SALMOREJO", "COLIFLOR", "YOGUR CON FRUTAS",
+        "ARROZ INTEGRAL", "QUESO CABRA", "AGUACATE", "GUACAMOLE",
+        "CURRY", "BACON", "TORTILLA", "TARTALETES", "TARTALETES FRESA",
+        "REGAÑA", "NACHOS", "PATATAS", "PAPEL HUMEDO", "COCKTAIL",
+        "CALABACIN", "TOMATE ENSALADA", "DIVERTIDAS", "AGUA DE COCO",
+        "MAIZ DULCE", "GUISANTES", "SANDWICH", "SALSA TIKKA",
+        "BASE PIZZA", "MAYONESA", "GOLDEN PECAN", "LIMPIA POROS",
+        "GARFITOS", "LASANA", "NARANJA", "COLA", "PETIT SABORES",
+        "CALDO POLLO", "LUCERNA", "COLOMBIA", "GELLY", "BATATA",
+        "PASAS", "LOMO", "AGUADOY", "CUQUITOS", "YUCA",
+        "CEREAL", "CAFES", "CHOCOLATE PURO", "CHOCO LECHE",
+        "MIGAS", "PISTO", "MENESTRA", "DISCOS",
+        "HUEVO FRESCO", "PIZZA", "ENTRECOT",
+        "AGUA FONTVELLA", "ACEITUNA", "PATATAS CAMPESINAS",
+        "BIMBO", "TORTA IMPERIAL", "TURRON", "JABON",
+        "PECHUGA PAVO", "CERDO CARRILLADA",
     ];
 
     private static List<ReceiptItem> FuzzyMatchProducts(List<ReceiptItem> items)
